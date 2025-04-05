@@ -1,128 +1,107 @@
 from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
+import httpx
 from bs4 import BeautifulSoup
-import requests
+from typing import List
 import re
+import asyncio
 
 app = FastAPI()
 
+TMDB_API = "3a08a646f83edac9a48438ac670a78b2"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-TMDB_API_KEY = "3a08a646f83edac9a48438ac670a78b2"
 
-# Extract quality
-def extract_quality(text):
-    match = re.search(r"(480p|720p|1080p|4K|2160p)", text, re.IGNORECASE)
+# Utility Functions
+
+def parse_quality(title):
+    match = re.search(r'(480p|720p|1080p|2160p)', title)
     return match.group(1) if match else "Unknown"
 
-# Extract language
-def extract_language(text):
-    langs = ["Tamil", "Hindi", "English", "Telugu", "Malayalam", "Kannada", "Dual Audio"]
-    for lang in langs:
-        if lang.lower() in text.lower():
-            return lang
+def parse_language(title):
+    title = title.lower()
+    if "tamil" in title:
+        return "Tamil"
+    if "hindi" in title:
+        return "Hindi"
+    if "telugu" in title:
+        return "Telugu"
+    if "malayalam" in title:
+        return "Malayalam"
+    if "english" in title:
+        return "English"
     return "Unknown"
 
-# TMDB Search
-def get_tmdb_data(query):
-    url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={query}"
-    res = requests.get(url)
-    if res.status_code != 200 or not res.json().get("results"):
-        return {}
-    movie = res.json()["results"][0]
-    return {
-        "title": movie.get("title"),
-        "year": movie.get("release_date", "")[:4],
-        "rating": movie.get("vote_average"),
-        "overview": movie.get("overview"),
-        "poster": f"https://image.tmdb.org/t/p/w500{movie.get('poster_path')}" if movie.get("poster_path") else "",
-        "tmdb_link": f"https://www.themoviedb.org/movie/{movie.get('id')}"
-    }
-
-# DuckDuckGo Scraper
-def duck_search(site, query):
-    url = f"https://duckduckgo.com/html?q=site:{site} {query} movie download"
-    res = requests.get(url, headers=HEADERS)
+# Fetch movie links using DuckDuckGo search
+async def fetch_duckduckgo(site: str, query: str):
+    url = f"https://html.duckduckgo.com/html?q=site:{site} {query}"
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url, headers=HEADERS)
     soup = BeautifulSoup(res.text, "html.parser")
     results = []
-    for link in soup.select(".result__a")[:3]:
-        results.append({"title": link.text, "link": link['href']})
+    for link in soup.select(".result__a")[:5]:
+        href = link['href']
+        if "login" not in href.lower():
+            results.append({
+                "source": site.split('.')[0],
+                "title": link.text,
+                "link": href,
+                "quality": parse_quality(link.text),
+                "language": parse_language(link.text)
+            })
     return results
 
+# Fetch movie details from TMDB API
+async def fetch_tmdb(query):
+    url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API}&query={query}"
+    async with httpx.AsyncClient() as client:
+        res = await client.get(url)
+    data = res.json()
+    if data['results']:
+        movie = data['results'][0]
+        return {
+            "title": movie['title'],
+            "year": movie['release_date'].split("-")[0] if movie.get("release_date") else "",
+            "rating": movie.get("vote_average"),
+            "overview": movie.get("overview"),
+            "poster": f"https://image.tmdb.org/t/p/w500{movie.get('poster_path')}",
+            "tmdb_link": f"https://www.themoviedb.org/movie/{movie['id']}"
+        }
+    return {}
+
 @app.get("/")
-def root():
+async def root():
     return {"message": "Welcome to Zero Super Movie API with Quality & Language!"}
 
 @app.get("/search")
-def search_all(q: str = Query(..., description="Movie name")):
-    return {
-        "tmdb": get_tmdb_data(q),
-        "filmxy": duck_search("filmxy.vip", q),
-        "hdhub4u": duck_search("hdhub4u.cricker", q),
-        "kittymovies": duck_search("kittymovies.cc", q)
-    }
+async def search_movie(q: str = Query(...)):
+    tmdb_data = await fetch_tmdb(q)
+    tasks = [
+        fetch_duckduckgo("filmxy.vip", q),
+        fetch_duckduckgo("hdhub4u.cricker", q),
+        fetch_duckduckgo("kittymovies.cc", q),
+        fetch_duckduckgo("1kuttymovies.cc", q)
+    ]
+    results = await asyncio.gather(*tasks)
+    return JSONResponse({
+        "tmdb": tmdb_data,
+        "filmxy": results[0],
+        "hdhub4u": results[1],
+        "kittymovies": results[2],
+        "kuttymovies": results[3]
+    })
 
 @app.get("/show")
-def show_links(q: str = Query(..., description="Movie name to get download links")):
-    data = {
-        "filmxy": [],
-        "hdhub4u": [],
-        "kittymovies": []
-    }
-
-    # Filmxy
-    for result in duck_search("filmxy.vip", q):
-        try:
-            r = requests.get(result["link"], headers=HEADERS, timeout=10)
-            s = BeautifulSoup(r.text, "html.parser")
-            links = s.select("a[href*='filmxy.vip/download/']")
-            data["filmxy"].append({
-                "title": result["title"],
-                "link": result["link"],
-                "downloads": [{
-                    "url": l["href"],
-                    "quality": extract_quality(l.text),
-                    "language": extract_language(l.text)
-                } for l in links]
-            })
-        except:
-            continue
-
-    # HDHub4u
-    for result in duck_search("hdhub4u.cricker", q):
-        try:
-            r = requests.get(result["link"], headers=HEADERS, timeout=10)
-            s = BeautifulSoup(r.text, "html.parser")
-            links = s.select("a[href*='download']")
-            data["hdhub4u"].append({
-                "title": result["title"],
-                "link": result["link"],
-                "downloads": [{
-                    "url": l["href"],
-                    "quality": extract_quality(l.text),
-                    "language": extract_language(l.text)
-                } for l in links]
-            })
-        except:
-            continue
-
-    # KittyMovies
-    for result in duck_search("kittymovies.cc", q):
-        try:
-            r = requests.get(result["link"], headers=HEADERS, timeout=10)
-            s = BeautifulSoup(r.text, "html.parser")
-            links = s.select("a[href$='.mkv'], a[href$='.mp4'], a[href*='download']")
-            data["kittymovies"].append({
-                "title": result["title"],
-                "link": result["link"],
-                "downloads": [{
-                    "url": l["href"],
-                    "quality": extract_quality(l.text),
-                    "language": extract_language(l.text)
-                } for l in links]
-            })
-        except:
-            continue
-
-    return {
-        "tmdb": get_tmdb_data(q),
-        "downloads": data
-    }
+async def show_downloads(q: str = Query(...)):
+    tmdb_data = await fetch_tmdb(q)
+    tasks = [
+        fetch_duckduckgo("filmxy.vip", q),
+        fetch_duckduckgo("hdhub4u.cricker", q),
+        fetch_duckduckgo("kittymovies.cc", q),
+        fetch_duckduckgo("1kuttymovies.cc", q)
+    ]
+    results = await asyncio.gather(*tasks)
+    all_links = results[0] + results[1] + results[2] + results[3]
+    return JSONResponse({
+        "tmdb": tmdb_data,
+        "downloads": all_links
+    })
